@@ -51,7 +51,20 @@ fn is_local_dev_host(host: &str) -> bool {
 /// Accepts `wss://` only. Plaintext `ws://` is a local-development exception:
 /// it is honored for loopback hosts in debug builds (`just relay` serves
 /// `ws://localhost:3000`) and rejected outright in release builds.
-pub(crate) fn validate_relay_hint(raw: &str) -> Result<RelayHint, String> {
+///
+/// `trusted_host` is the host of the community relay the user is already
+/// connected to. A hint naming that host is exempt from the private-address
+/// screen, because the screen otherwise rejects the one relay the user
+/// demonstrably trusts: Tailscale allocates from `100.64.0.0/10`, which
+/// [`buzz_core_pkg::network::is_private_ip`] classifies as CGNAT, so every
+/// `*.ts.net` deployment — and any LAN or internal relay — would be refused.
+/// The threat this screen exists for is a *link* steering the client at
+/// localhost or a neighbouring internal service, and that is unaffected: the
+/// exemption covers exactly one host, the one already configured out of band.
+pub(crate) fn validate_relay_hint(
+    raw: &str,
+    trusted_host: Option<&str>,
+) -> Result<RelayHint, String> {
     let parsed = url::Url::parse(raw).map_err(|_| format!("Invalid relay hint: {raw}"))?;
     let host = parsed
         .host_str()
@@ -60,9 +73,11 @@ pub(crate) fn validate_relay_hint(raw: &str) -> Result<RelayHint, String> {
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(format!("Relay hints must not carry credentials: {raw}"));
     }
-    let allow_private = match parsed.scheme() {
-        "wss" => false,
-        "ws" if cfg!(debug_assertions) && is_local_dev_host(&host) => true,
+    let is_configured_relay =
+        trusted_host.is_some_and(|trusted| trusted.eq_ignore_ascii_case(&host));
+    let (allow_private, default_port) = match parsed.scheme() {
+        "wss" => (is_configured_relay, 443u16),
+        "ws" if cfg!(debug_assertions) && is_local_dev_host(&host) => (true, 80),
         "ws" => {
             return Err(format!(
                 "Relay hints must use wss:// (plaintext ws:// is local-development only): {raw}"
@@ -70,15 +85,21 @@ pub(crate) fn validate_relay_hint(raw: &str) -> Result<RelayHint, String> {
         }
         _ => return Err(format!("Relay hints must be ws(s) URLs: {raw}")),
     };
-    let port = parsed
-        .port()
-        .unwrap_or(if allow_private { 80 } else { 443 });
+    let port = parsed.port().unwrap_or(default_port);
     Ok(RelayHint {
         url: raw.to_string(),
         host,
         port,
         allow_private,
     })
+}
+
+/// Extract the bare host of the active community relay for use as
+/// [`validate_relay_hint`]'s `trusted_host`.
+pub(crate) fn relay_host_of(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
 }
 
 /// Resolve the hint host and return the address to connect to, rejecting the
@@ -197,25 +218,86 @@ mod tests {
 
     #[test]
     fn accepts_public_wss_hint() {
-        let hint = validate_relay_hint("wss://relay.damus.io").expect("valid hint");
+        let hint = validate_relay_hint("wss://relay.damus.io", None).expect("valid hint");
         assert_eq!(hint.host, "relay.damus.io");
         assert_eq!(hint.port, 443);
         assert!(!hint.allow_private);
     }
 
+    /// Tailscale allocates from 100.64.0.0/10, which `is_private_ip` classifies
+    /// as CGNAT. Without the configured-relay exemption the screen rejects every
+    /// `*.ts.net` deployment — i.e. the user's own relay, reached by the host
+    /// they already connected to out of band.
+    #[test]
+    fn configured_relay_host_is_exempt_from_the_private_address_screen() {
+        let untrusted =
+            validate_relay_hint("wss://buzz-demo.tail4f6a7.ts.net", None).expect("valid shape");
+        assert!(
+            !untrusted.allow_private,
+            "an unrelated host must stay screened"
+        );
+
+        let trusted = validate_relay_hint(
+            "wss://buzz-demo.tail4f6a7.ts.net",
+            Some("buzz-demo.tail4f6a7.ts.net"),
+        )
+        .expect("valid shape");
+        assert!(trusted.allow_private);
+        assert_eq!(trusted.port, 443, "wss must still default to 443");
+    }
+
+    #[test]
+    fn the_exemption_covers_only_the_configured_host() {
+        // A link may carry many hints; naming the trusted relay must not
+        // launder a second, unrelated private target past the screen.
+        let other = validate_relay_hint("wss://internal.corp", Some("buzz-demo.tail4f6a7.ts.net"))
+            .expect("valid shape");
+        assert!(!other.allow_private);
+
+        // Case-insensitive, since hostnames are.
+        let mixed_case = validate_relay_hint(
+            "wss://Buzz-Demo.Tail4F6A7.TS.NET",
+            Some("buzz-demo.tail4f6a7.ts.net"),
+        )
+        .expect("valid shape");
+        assert!(mixed_case.allow_private);
+    }
+
+    #[test]
+    fn trust_does_not_relax_scheme_or_credential_rules() {
+        let host = Some("relay.example");
+        assert!(validate_relay_hint("https://relay.example", host).is_err());
+        assert!(validate_relay_hint("wss://user:pass@relay.example", host).is_err());
+        // Trust exempts the address screen, not the plaintext ban.
+        assert!(validate_relay_hint("ws://relay.example", host).is_err());
+    }
+
+    #[test]
+    fn relay_host_of_extracts_and_lowercases() {
+        assert_eq!(
+            relay_host_of("https://Buzz-Demo.Tail4F6A7.ts.net").as_deref(),
+            Some("buzz-demo.tail4f6a7.ts.net")
+        );
+        assert_eq!(
+            relay_host_of("https://relay.example:8443/base").as_deref(),
+            Some("relay.example")
+        );
+        assert_eq!(relay_host_of("not a url"), None);
+    }
+
     #[test]
     fn rejects_non_ws_schemes_and_credentials() {
-        assert!(validate_relay_hint("https://evil.example").is_err());
-        assert!(validate_relay_hint("wss://user:pass@relay.example").is_err());
-        assert!(validate_relay_hint("wss://").is_err());
-        assert!(validate_relay_hint("not a url").is_err());
+        assert!(validate_relay_hint("https://evil.example", None).is_err());
+        assert!(validate_relay_hint("wss://user:pass@relay.example", None).is_err());
+        assert!(validate_relay_hint("wss://", None).is_err());
+        assert!(validate_relay_hint("not a url", None).is_err());
     }
 
     #[test]
     fn plaintext_ws_is_limited_to_local_development() {
         // Non-loopback plaintext is rejected in every build profile.
-        assert!(validate_relay_hint("ws://relay.example").is_err());
-        let loopback = validate_relay_hint("ws://127.0.0.1:3000");
+        assert!(validate_relay_hint("ws://relay.example", None).is_err());
+        let loopback = validate_relay_hint("ws://127.0.0.1:3000", None);
         if cfg!(debug_assertions) {
             let hint = loopback.expect("loopback dev hint");
             assert!(hint.allow_private);

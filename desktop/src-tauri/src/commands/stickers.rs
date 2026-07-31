@@ -285,7 +285,10 @@ struct NostrStickerPackLink {
 /// [`validate_relay_hint`] (wss-only outside local development, no
 /// credentials) and are capped so a crafted link cannot fan the app out to
 /// dozens of sockets.
-fn parse_nostr_sticker_pack_link(input: &str) -> Result<NostrStickerPackLink, String> {
+fn parse_nostr_sticker_pack_link(
+    input: &str,
+    trusted_host: Option<&str>,
+) -> Result<NostrStickerPackLink, String> {
     const INVALID: &str = "Enter a Sonar sticker pack link \
         (https://…/stickers?a=30031:…) or a 30031:<author>:<identifier> coordinate.";
     let trimmed = input.trim();
@@ -308,7 +311,7 @@ fn parse_nostr_sticker_pack_link(input: &str) -> Result<NostrStickerPackLink, St
             sonar_stickers::PackAddress::parse(&coordinate).map_err(|_| INVALID.to_string())?;
         let mut valid_relays = Vec::with_capacity(relays.len());
         for relay in &relays {
-            valid_relays.push(validate_relay_hint(relay)?);
+            valid_relays.push(validate_relay_hint(relay, trusted_host)?);
         }
         valid_relays.truncate(MAX_PACK_LINK_RELAYS);
         return Ok(NostrStickerPackLink {
@@ -430,7 +433,11 @@ pub async fn import_nostr_sticker_pack(
     state: State<'_, AppState>,
 ) -> Result<ImportedStickerDraft, String> {
     require_https_sticker_relay(&state)?;
-    let parsed = parse_nostr_sticker_pack_link(&link)?;
+    // The community relay the user is already connected to is exempt from the
+    // hint screen's private-address rule — see `validate_relay_hint`.
+    let configured_relay = relay_api_base_url_with_override(&state);
+    let trusted_host = super::sticker_relay::relay_host_of(&configured_relay);
+    let parsed = parse_nostr_sticker_pack_link(&link, trusted_host.as_deref())?;
     if parsed.relays.is_empty() {
         return Err(
             "That pack link has no relay hints. Use a link that includes relay= parameters."
@@ -532,7 +539,7 @@ mod tests {
         let link = format!(
             "https://sonarprivacy.xyz/stickers?a=30031:{AUTHOR}:signal-abc&relay=wss%3A%2F%2Frelay.damus.io&relay=wss%3A%2F%2Fnos.lol"
         );
-        let parsed = parse_nostr_sticker_pack_link(&link).expect("valid link");
+        let parsed = parse_nostr_sticker_pack_link(&link, None).expect("valid link");
         assert_eq!(parsed.address.author_pubkey_hex, AUTHOR);
         assert_eq!(parsed.address.identifier, "signal-abc");
         assert_eq!(
@@ -550,7 +557,7 @@ mod tests {
 
     #[test]
     fn nostr_pack_link_parses_bare_coordinate_without_relays() {
-        let parsed = parse_nostr_sticker_pack_link(&format!("30031:{AUTHOR}:my-pack"))
+        let parsed = parse_nostr_sticker_pack_link(&format!("30031:{AUTHOR}:my-pack"), None)
             .expect("valid coordinate");
         assert_eq!(parsed.address.identifier, "my-pack");
         assert!(parsed.relays.is_empty());
@@ -559,36 +566,46 @@ mod tests {
     #[test]
     fn nostr_pack_link_rejects_bad_inputs() {
         // http (not https) pack links
-        assert!(
-            parse_nostr_sticker_pack_link("http://sonarprivacy.xyz/stickers?a=30031:x:y").is_err()
-        );
+        assert!(parse_nostr_sticker_pack_link(
+            "http://sonarprivacy.xyz/stickers?a=30031:x:y",
+            None
+        )
+        .is_err());
         // missing ?a= coordinate
         assert!(parse_nostr_sticker_pack_link(
-            "https://sonarprivacy.xyz/stickers?relay=wss://nos.lol"
+            "https://sonarprivacy.xyz/stickers?relay=wss://nos.lol",
+            None
         )
         .is_err());
         // non-30031 coordinate
-        assert!(parse_nostr_sticker_pack_link(&format!(
-            "https://sonarprivacy.xyz/stickers?a=30030:{AUTHOR}:x"
-        ))
+        assert!(parse_nostr_sticker_pack_link(
+            &format!("https://sonarprivacy.xyz/stickers?a=30030:{AUTHOR}:x"),
+            None
+        )
         .is_err());
         // non-ws relay hint
-        assert!(parse_nostr_sticker_pack_link(&format!(
+        assert!(parse_nostr_sticker_pack_link(
+            &format!(
             "https://sonarprivacy.xyz/stickers?a=30031:{AUTHOR}:x&relay=https%3A%2F%2Fevil.example"
-        ))
+        ),
+            None
+        )
         .is_err());
         // plaintext ws hint to a non-loopback host (SSRF / downgrade)
-        assert!(parse_nostr_sticker_pack_link(&format!(
+        assert!(parse_nostr_sticker_pack_link(
+            &format!(
             "https://sonarprivacy.xyz/stickers?a=30031:{AUTHOR}:x&relay=ws%3A%2F%2F10.0.0.1%3A3000"
-        ))
+        ),
+            None
+        )
         .is_err());
         // relay hint carrying credentials
         assert!(parse_nostr_sticker_pack_link(&format!(
             "https://sonarprivacy.xyz/stickers?a=30031:{AUTHOR}:x&relay=wss%3A%2F%2Fu%3Ap%40relay.example"
-        ))
+        ), None)
         .is_err());
         // garbage
-        assert!(parse_nostr_sticker_pack_link("hello world").is_err());
+        assert!(parse_nostr_sticker_pack_link("hello world", None).is_err());
     }
 
     #[test]
@@ -648,7 +665,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("&");
         let link = format!("https://sonarprivacy.xyz/stickers?a=30031:{AUTHOR}:x&{relays}");
-        let parsed = parse_nostr_sticker_pack_link(&link).expect("valid link");
+        let parsed = parse_nostr_sticker_pack_link(&link, None).expect("valid link");
         assert_eq!(parsed.relays.len(), MAX_PACK_LINK_RELAYS);
     }
 
