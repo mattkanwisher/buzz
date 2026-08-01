@@ -79,7 +79,13 @@ function PackPreview({
   );
 }
 
-function PackAuthorForm({ onPublished }: { onPublished: () => void }) {
+function PackAuthorForm({
+  canCurate,
+  onPublished,
+}: {
+  canCurate: boolean;
+  onPublished: () => void;
+}) {
   const ownPacks = useOwnStickerPacksQuery().data ?? [];
   const [identifier, setIdentifier] = React.useState("");
   const [title, setTitle] = React.useState("");
@@ -89,6 +95,7 @@ function PackAuthorForm({ onPublished }: { onPublished: () => void }) {
   const [stickers, setStickers] = React.useState<StickerAsset[]>([]);
   const [packLink, setPackLink] = React.useState("");
   const [isWorking, setIsWorking] = React.useState(false);
+  const [isImporting, setIsImporting] = React.useState(false);
 
   const loadPack = React.useCallback((pack: StickerPack) => {
     setIdentifier(pack.identifier);
@@ -168,6 +175,12 @@ function PackAuthorForm({ onPublished }: { onPublished: () => void }) {
     // Signal links carry a secret pack key; Sonar links are public metadata.
     const isSignal = link.includes("signal.art/addstickers");
     setIsWorking(true);
+    setIsImporting(true);
+    if (isSignal) {
+      // Sequential per-sticker fetch + re-upload; a 25-sticker pack is tens of
+      // seconds. Say so, or it reads as a freeze.
+      toast.info("Importing from Signal — this can take up to a minute.");
+    }
     try {
       const imported = isSignal
         ? await importSignalStickerPack(link)
@@ -215,6 +228,7 @@ function PackAuthorForm({ onPublished }: { onPublished: () => void }) {
       // The link exists only for the duration of this invoke (Signal links
       // carry a secret pack key and are zeroized in trusted Rust).
       setPackLink("");
+      setIsImporting(false);
       setIsWorking(false);
     }
   }, [packLink]);
@@ -230,7 +244,16 @@ function PackAuthorForm({ onPublished }: { onPublished: () => void }) {
         cover,
         stickers,
       });
-      toast.success("Sticker pack published.");
+      // Publishing is not the last step: the catalog is admin-curated, so an
+      // unapproved pack is invisible everywhere except the approval queue.
+      // Saying only "published" sends people to the composer to look for a
+      // pack that cannot be there yet.
+      toast.success(
+        canCurate
+          ? "Sticker pack published. Approve it in “Awaiting catalog approval” above to add it to this community."
+          : "Sticker pack published. An admin needs to approve it before it appears in the sticker picker.",
+        { duration: 8000 },
+      );
       onPublished();
     } catch (error) {
       toast.error(
@@ -239,7 +262,16 @@ function PackAuthorForm({ onPublished }: { onPublished: () => void }) {
     } finally {
       setIsWorking(false);
     }
-  }, [cover, description, identifier, license, onPublished, stickers, title]);
+  }, [
+    canCurate,
+    cover,
+    description,
+    identifier,
+    license,
+    onPublished,
+    stickers,
+    title,
+  ]);
 
   return (
     <SettingsOptionGroup className="space-y-4 p-4">
@@ -329,7 +361,11 @@ function PackAuthorForm({ onPublished }: { onPublished: () => void }) {
           autoComplete="off"
           onChange={(event) => setPackLink(event.target.value)}
           placeholder="Signal or Sonar pack link (https://…)"
-          type="password"
+          // Plain text: pack links are pasted from public directories such as
+          // signalstickers.com, so masking them hid the URL without protecting
+          // anything. The `pack_key` fragment is still the pack's decryption
+          // key — it is zeroized in Rust after import and never persisted here.
+          type="text"
           value={packLink}
         />
         <Button
@@ -338,7 +374,10 @@ function PackAuthorForm({ onPublished }: { onPublished: () => void }) {
           type="button"
           variant="secondary"
         >
-          Import pack
+          {/* A Signal import fetches and re-uploads every sticker one at a
+              time — tens of seconds. Without a label change the disabled
+              button is indistinguishable from a hang. */}
+          {isImporting ? "Importing…" : "Import pack"}
         </Button>
       </div>
       <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
@@ -579,7 +618,10 @@ export function StickerSettingsCard() {
           </SettingsOptionGroup>
         ) : null}
 
-        <PackAuthorForm onPublished={invalidatePublished} />
+        <PackAuthorForm
+          canCurate={canCurate}
+          onPublished={invalidatePublished}
+        />
       </div>
     </section>
   );
